@@ -256,12 +256,22 @@ for forbidden in ("cloudDataBase", "syncCloudSnapshot", "cloudLoaded", "cloudDat
 if (ROOT / "tools/refresh_market_data.py").exists() or (ROOT / "tests/test_refresh_market_data.py").exists() or (ROOT.parent / ".github/workflows/v6-kline-cloud-update.yml").exists():
     fail("legacy cloud K-line publisher, tests, or scheduled workflow remain")
 
-# The bottom signal ticker and Bark web-feed consumer are fully removed.
-for forbidden in ("signal-ticker", "signal-track", "createBarkFeed", "createSignalTicker", "refreshSignals", "public-signals.json"):
-    if forbidden in runtime or forbidden in index_source:
-        fail(f"removed bottom signal system reference remains: {forbidden}")
-if (ROOT / "modules/signal-ticker").exists() or (ROOT / "tests/signal-feed.test.mjs").exists():
-    fail("removed bottom signal system files remain")
+# Bark signal ticker is a separate overlay; it does not alter the seven V9 systems.
+signal_module = ROOT / "modules/signal-ticker/signal-ticker.js"
+signal_style = ROOT / "modules/signal-ticker/signal-ticker.css"
+if not signal_module.is_file() or not signal_style.is_file():
+    fail("Bark signal ticker module or stylesheet is missing")
+if 'id="signal-ticker"' not in index_source:
+    fail("Bark signal ticker host is missing from the V9 page")
+if "signal-ticker.js?v=" + STATIC_ASSET_VERSION not in index_source:
+    fail("Bark signal ticker module cache version is missing or stale")
+if "signal-ticker.css?v=" + STATIC_ASSET_VERSION not in index_source:
+    fail("Bark signal ticker stylesheet cache version is missing or stale")
+signal_source = signal_module.read_text(encoding="utf-8")
+if "raw.githubusercontent.com/MraJJqq/Vegasbark/main/public/signals.json" not in signal_source:
+    fail("Bark public signal feed URL is not configured")
+if "15000" not in signal_source or "𝐍𝐨 𝐒𝐢𝐠𝐧𝐚𝐥" not in signal_source or '" ▰\\u00A0"' not in signal_source:
+    fail("Bark signal refresh cadence or notification text format is incorrect")
 
 # Report every check only after all validation rules have run.
 if errors:
