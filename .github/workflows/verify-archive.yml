@@ -1,0 +1,32 @@
+name: Verify archived V9 baseline
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install isolated test dependency
+        run: |
+          mkdir -p "$RUNNER_TEMP/vegas-test-deps"
+          npm install --prefix "$RUNNER_TEMP/vegas-test-deps" fake-indexeddb@6
+          ln -s "$RUNNER_TEMP/vegas-test-deps/node_modules" source/node_modules
+      - name: Run archived source tests
+        working-directory: source
+        run: npm test
+      - name: Validate archived source and assets
+        working-directory: source
+        run: npm run validate
