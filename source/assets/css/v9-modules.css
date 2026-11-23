@@ -1,0 +1,13 @@
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+html,body{background:#07110D}#app{background:transparent}
+html,body{color:#e8f5ff;-webkit-text-size-adjust:100%;text-size-adjust:100%;font:13px/1.45 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+#app{isolation:isolate}
+#kline-host{z-index:5;display:block;background:transparent;pointer-events:auto;opacity:0;transition:opacity 1.5s ease-in-out}
+#kline-host.is-ready{opacity:1}
+#app.is-symbol-transitioning #kline-host{opacity:0}
+#logo-frame{z-index:10;display:block;background:transparent;overflow:hidden;pointer-events:none;opacity:0;transition:opacity .12s ease-out}
+#logo-frame.is-ready{opacity:1}
+#rolling-cards-frame{z-index:1000;display:block;background:transparent;overflow:hidden;pointer-events:auto;opacity:0;transition:opacity .12s ease-out}
+#rolling-cards-frame.is-ready{opacity:1}
+html.vegas-page-hidden #logo-frame,html.vegas-page-hidden #rolling-cards-frame{visibility:hidden;opacity:0}
+

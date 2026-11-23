@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#07110D">
+<title>VEGAS V9 · Gate</title>
+<link rel="icon" type="image/svg+xml" href="./assets/icons/App-Icon.svg?v=v9-independent-1">
+<link rel="apple-touch-icon" sizes="180x180" href="./assets/icons/App-Icon-180.png?v=v9-independent-1">
+<link rel="stylesheet" href="./background/background.css?v=v9-static-20261123-1">
+<link rel="stylesheet" href="./cards/rolling-cards.css?v=v9-static-20261123-1">
+<link rel="stylesheet" href="./assets/css/v9-modules.css?v=v9-static-20261123-1">
+<link rel="stylesheet" href="./modules/timeframe-switch/host.css?v=v9-static-20261123-1">
+<link rel="stylesheet" href="./assets/css/full-screen-dynamic.css?v=v9-static-20261123-1">
+</head>
+<body>
+<main id="app">
+  <div id="background-layer" aria-hidden="true"></div>
+  <div id="kline-host" aria-label="Gate K线"></div>
+  <iframe id="logo-frame" src="./modules/logo/logo.html?v=v9-local-kline-20261123-1" title="VEGAS Logo 模块" loading="eager" allowtransparency="true" onload="this.classList.add('is-ready')"></iframe>
+  <iframe id="timeframe-frame" src="./modules/timeframe-switch/index.html?v=v9-timeframe-wheel-1" title="周期切换" loading="eager" allowtransparency="true" onload="this.classList.add('is-ready')"></iframe>
+  <div id="rolling-cards-frame" aria-label="22张行情卡片滚动"><div id="ring"><div id="vp"></div></div></div>
+</main>
+<script src="./modules/shared/instrument-catalog.js?v=v9-static-20261123-1"></script>
+<script src="./cards/rolling-cards.js?v=v9-static-20261123-1" defer></script>
+<script type="module" src="./modules/v9-runtime.js?v=v9-local-kline-20261123-1"></script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+/* Independent VEGAS background system. Visual baseline intentionally unchanged. */
+#background-layer{position:absolute;inset:0;z-index:0;background:#07110D;pointer-events:none;}

@@ -1,0 +1,30 @@
+name: V9 CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install isolated test dependency
+        run: |
+          mkdir -p "$RUNNER_TEMP/vegas-test-deps"
+          npm install --prefix "$RUNNER_TEMP/vegas-test-deps" fake-indexeddb@6
+          ln -s "$RUNNER_TEMP/vegas-test-deps/node_modules" node_modules
+      - name: Run tests
+        run: node --test tests/*.test.mjs
+      - name: Validate source and assets
+        run: python3 tools/validate_v9.py

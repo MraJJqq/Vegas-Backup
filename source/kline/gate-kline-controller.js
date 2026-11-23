@@ -1,0 +1,533 @@
+import { EMA_PERIODS, calculateVegasEma, emaSourceSignature, advanceEmaValue, seedEmaValue } from "./ema-engine.js?v=v9-local-kline-20261123-1";
+const DB_NAME="vegas-v9-market-cache",DB_VERSION=3,LEGACY_STORE="candles",STORE="candleRows",META_STORE="seriesMeta",EMA_STORE="emaRows",EMA_VERSION=1;
+let storageCheckAt=0;
+const INTERVALS=Object.freeze({"1H":"1h","2H":"1h","4H":"4h","8H":"8h","D":"1d"});
+const TIMEFRAMES=Object.freeze(["1H","2H","4H","8H","D"]);
+const MS=Object.freeze({"1H":3600000,"2H":7200000,"4H":14400000,"8H":28800000,"D":86400000});
+export const GATE_REQUEST_TIMEOUT_MS=15000;
+const PAGE=2000,API="https://api.gateio.ws/api/v4/futures/usdt",WS_URL="wss://fx-ws.gateio.ws/v4/ws/usdt";
+export function twoHourRangeWindows(from,to,pageSize=PAGE){
+ const step=3600,bucket=7200,limit=Math.min(PAGE,Math.floor(Number(pageSize)/2)*2);
+ if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to)||from<0||to<from||from%bucket!==0)throw new TypeError("Invalid 2H history range");
+ if(!Number.isFinite(limit)||limit<2)throw new TypeError("2H history page size must allow a complete hourly pair");
+ const end=Math.floor(to/bucket)*bucket+step,windows=[];
+ for(let cursor=from;cursor<=end;){
+  const windowEnd=Math.min(end,cursor+(limit-1)*step);
+  windows.push({from:cursor,to:windowEnd});
+  cursor=windowEnd+step;
+ }
+ return windows;
+}
+// UTC+8 midnight is 16:00 UTC; align daily candle timestamps to that epoch offset.
+const timeframeOffsetSeconds=tf=>tf==="D"?16*3600:0;
+export function findCandleGaps(rows,tf){
+ const step=MS[tf]/1000,offset=timeframeOffsetSeconds(tf);if(!step||!Array.isArray(rows))throw new TypeError("Unsupported timeframe or candle rows");
+ const gaps=[];for(let i=1;i<rows.length;i++){const previous=rows[i-1].t,current=rows[i].t,delta=current-previous,misaligned=(previous-offset)%step!==0||(current-offset)%step!==0||delta%step!==0;if(delta>step||misaligned)gaps.push({from:previous+step,to:current-step,missingCount:Math.max(0,Math.floor(delta/step)-1),misaligned})}return gaps;
+}
+export function expectedLatestCandleTimestamp(tf,now=Date.now(),graceMs=120000){
+ const stepMs=MS[tf],offsetMs=timeframeOffsetSeconds(tf)*1000;if(!stepMs)throw new TypeError("Unsupported timeframe");
+ const bucket=Math.floor((now-offsetMs)/stepMs)*stepMs+offsetMs,withinBucket=now-bucket;
+ return (bucket-stepMs-(withinBucket<Math.min(graceMs,stepMs/10)?stepMs:0))/1000;
+}
+export function hasLatestCoverage(rows,tf,now=Date.now(),graceMs=120000){
+ const stepMs=MS[tf];if(!stepMs||!Array.isArray(rows)||!rows.length)return false;
+ const step=stepMs/1000;if(rows.some(row=>!Number.isFinite(row.t)||(row.t-timeframeOffsetSeconds(tf))%step!==0)||findCandleGaps(rows,tf).length)return false;
+ return rows[rows.length-1].t>=expectedLatestCandleTimestamp(tf,now,graceMs);
+}
+export function historyRetryDelay(attempt){return Math.min(300000,30000*2**Math.min(Math.max(0,Number(attempt)||0),4));}
+const keyOf=(contract,tf)=>"gate-usdt:"+contract+":"+tf;
+const normalize=rows=>(Array.isArray(rows)?rows:[]).map(r=>({t:Number(r.t??r[0]),o:Number(r.o??r[5]??r[1]),h:Number(r.h??r[3]??r[2]),l:Number(r.l??r[4]??r[3]),c:Number(r.c??r[2]??r[4])})).filter(x=>Number.isFinite(x.t)&&x.t>0&&[x.o,x.h,x.l,x.c].every(v=>Number.isFinite(v)&&v>0)&&x.h>=Math.max(x.o,x.c)&&x.l<=Math.min(x.o,x.c)&&x.h>=x.l);
+const merge=(...groups)=>{const m=new Map();for(const g of groups)for(const c of g||[])m.set(c.t,c);return [...m.values()].sort((a,b)=>a.t-b.t)};
+export function mergePendingWriteRows(previous,next){return {rows:merge(previous?.rows,next.rows),done:previous?previous.done===true&&next.done===true:next.done===true,status:next.status||previous?.status||"ok",error:next.error??previous?.error??null}};
+export function aggregate2H(rows,now=Date.now()){
+ const groups=new Map();
+ for(const candle of merge(rows)){
+  const start=Math.floor(candle.t/7200)*7200;
+  if(!groups.has(start))groups.set(start,[]);
+  groups.get(start).push(candle);
+ }
+ const currentHour=Math.floor(now/3600000)*3600,currentBucket=Math.floor(currentHour/7200)*7200,out=[];
+ for(const [start,items] of groups){
+  items.sort((a,b)=>a.t-b.t);
+  const first=items[0],second=items[1],isCurrent=start===currentBucket;
+  // Historical buckets require both closed 1H candles; the active bucket may use only its current Gate 1H candle.
+  if(items.length===2&&first.t===start&&second.t===start+3600&&(start+7200<=currentHour||(isCurrent&&second.t===currentHour))){
+   out.push({t:start,o:first.o,h:Math.max(first.h,second.h),l:Math.min(first.l,second.l),c:second.c});
+  }else if(items.length===1&&isCurrent&&first.t===currentHour){
+   out.push({t:start,o:first.o,h:first.h,l:first.l,c:first.c});
+  }
+ }
+ return out;
+}
+function openDB(){return new Promise((resolve,reject)=>{if(!("indexedDB"in window))return reject(new Error("IndexedDB unavailable; durable K-line cache cannot start"));const q=indexedDB.open(DB_NAME,DB_VERSION);q.onupgradeneeded=()=>{const db=q.result;if(!db.objectStoreNames.contains(STORE)){const rows=db.createObjectStore(STORE,{keyPath:"id"});rows.createIndex("series","series",{unique:false})}if(!db.objectStoreNames.contains(META_STORE))db.createObjectStore(META_STORE,{keyPath:"id"});if(!db.objectStoreNames.contains(EMA_STORE)){const ema=db.createObjectStore(EMA_STORE,{keyPath:"id"});ema.createIndex("series","series",{unique:false})}if(!db.objectStoreNames.contains(LEGACY_STORE))db.createObjectStore(LEGACY_STORE,{keyPath:"id"})};q.onsuccess=()=>{q.result.onversionchange=()=>q.result.close();resolve(q.result)};q.onerror=()=>reject(q.error||new Error("IndexedDB open failed"));q.onblocked=()=>reject(new Error("IndexedDB upgrade blocked"))})}
+function calculateEmaRows(rows){return calculateVegasEma(rows)}
+async function ensureEmaSeries(key,rows,db){
+ if(!Array.isArray(rows)||!rows.length||!db)return false;
+ const cached=await readEmaSeries(key,rows,db);if(cached)return cached;
+ return new Promise((resolve,reject)=>{
+  let tx;try{tx=db.transaction([EMA_STORE,META_STORE],"readwrite")}catch(error){reject(error);return}
+  const store=tx.objectStore(EMA_STORE),metaStore=tx.objectStore(META_STORE),validTimes=new Set(rows.map(row=>row.t));
+  let cursorDone=false,finished=false,result=null;
+  const fail=error=>{if(finished)return;finished=true;try{tx.abort()}catch(_){}reject(error||new Error("EMA cache transaction failed"))};
+  const cursorReq=store.index("series").openCursor(IDBKeyRange.only(key));
+  cursorReq.onsuccess=()=>{
+   const cursor=cursorReq.result;
+   if(cursor){if(!validTimes.has(cursor.value.t))cursor.delete();cursor.continue();return}
+   if(cursorDone||finished)return;
+   cursorDone=true;
+   const values=calculateEmaRows(rows),periods=EMA_PERIODS;result=Object.fromEntries(periods.map(period=>[String(period),[]]));
+   for(let i=0;i<rows.length;i++){
+    const record={id:key+"|"+rows[i].t,series:key,t:rows[i].t,sourceClose:rows[i].c};
+    for(const period of periods){const value=values.get(period)[i],valid=Number.isFinite(value)?value:null;record["e"+period]=valid;result[String(period)].push(valid)}
+    store.put(record);
+   }
+   metaStore.put({id:"ema|"+key,version:EMA_VERSION,candleCount:rows.length,oldestTimestamp:rows[0].t,newestTimestamp:rows[rows.length-1].t,newestClose:rows[rows.length-1].c,sourceSignature:emaSourceSignature(rows),periods,updatedAt:Date.now()});
+  };
+  cursorReq.onerror=()=>fail(tx.error);
+  tx.oncomplete=()=>{if(!finished){finished=true;resolve(result||false)}};
+  tx.onerror=tx.onabort=()=>fail(tx.error);
+ });
+}
+async function readEmaSeries(key,rows,db){
+ if(!Array.isArray(rows)||!rows.length||!db)return null;
+ return new Promise(resolve=>{
+  let tx,meta=null,records=null,ready=0,finished=false;
+  const done=()=>{
+   if(finished||ready!==2)return;
+   finished=true;
+   if(!meta||meta.version!==EMA_VERSION||meta.candleCount!==rows.length||
+      meta.oldestTimestamp!==rows[0].t||meta.newestTimestamp!==rows[rows.length-1].t||
+      meta.newestClose!==rows[rows.length-1].c||meta.sourceSignature!==emaSourceSignature(rows)||
+      !Array.isArray(records)||records.length!==rows.length){resolve(null);return}
+   records.sort((a,b)=>a.t-b.t);
+   const periods=EMA_PERIODS,values=Object.fromEntries(periods.map(period=>[String(period),[]]));
+   for(let i=0;i<rows.length;i++){
+    const record=records[i],candle=rows[i];
+    if(record?.t!==candle.t||record?.sourceClose!==candle.c){resolve(null);return}
+    for(const period of periods){
+     const value=record["e"+period],shouldExist=i>=period-1;
+     if(shouldExist?!(Number.isFinite(value)&&value>0):value!==null){resolve(null);return}
+     values[String(period)].push(shouldExist?value:null);
+    }
+   }
+   resolve(values);
+  };
+  try{tx=db.transaction([EMA_STORE,META_STORE],"readonly")}catch(_){resolve(null);return}
+  const store=tx.objectStore(EMA_STORE),metaReq=tx.objectStore(META_STORE).get("ema|"+key),rowsReq=store.index("series").getAll(key);
+  metaReq.onsuccess=()=>{meta=metaReq.result||null;ready++;done()};
+  rowsReq.onsuccess=()=>{records=rowsReq.result||[];ready++;done()};
+  metaReq.onerror=rowsReq.onerror=()=>{if(!finished){finished=true;resolve(null)}};
+  tx.onabort=tx.onerror=()=>{if(!finished){finished=true;resolve(null)}};
+ });
+}
+async function updateLatestEma(key,rows,db){
+ if(!Array.isArray(rows)||!rows.length||!db)return false;
+ return new Promise((resolve,reject)=>{
+  let tx;try{tx=db.transaction([EMA_STORE,META_STORE],"readwrite")}catch(error){reject(error);return}
+  const store=tx.objectStore(EMA_STORE),metaStore=tx.objectStore(META_STORE),metaReq=metaStore.get("ema|"+key);
+  let meta=null,ready=false,finished=false,needsFull=false;
+  const fail=error=>{if(finished)return;finished=true;try{tx.abort()}catch(_){}reject(error||new Error("EMA latest cache transaction failed"))};
+  const full=()=>{needsFull=true;try{tx.abort()}catch(_){}};
+  metaReq.onsuccess=()=>{
+   meta=metaReq.result||null;ready=true;
+   if(!meta||meta.version!==EMA_VERSION||!meta.candleCount){full();return}
+   const sourceSignature=emaSourceSignature(rows),last=rows[rows.length-1],same=meta.newestTimestamp===last.t;
+   if(meta.sourceSignature===sourceSignature&&meta.candleCount===rows.length){finished=true;resolve(true);return}
+   if(rows.length!==meta.candleCount+1||same||meta.sourceSignature!==emaSourceSignature(rows.slice(0,-1))){full();return}
+   const previousTime=rows[rows.length-2]?.t,previousReq=previousTime?store.get(key+"|"+previousTime):null;
+   const apply=record=>{
+    const previous=rows[rows.length-2];
+    const validRecord=record&&record.id===key+"|"+previousTime&&record.series===key&&record.t===previousTime&&record.sourceClose===previous.c;
+    if(!validRecord){full();return}
+    const periods=EMA_PERIODS,output={id:key+"|"+last.t,series:key,t:last.t,sourceClose:last.c};
+    for(const period of periods){
+     let value=null;
+     if(rows.length>=period){
+      if(rows.length===period){value=seedEmaValue(rows,period)}
+      else{const prior=record["e"+period];if(!Number.isFinite(prior)||prior<=0){full();return}value=advanceEmaValue(last.c,prior,period)}
+     }else if(record["e"+period]!==null){full();return}
+     output["e"+period]=Number.isFinite(value)?value:null;
+    }
+    store.put(output);metaStore.put({...meta,id:"ema|"+key,candleCount:rows.length,newestTimestamp:last.t,newestClose:last.c,sourceSignature,updatedAt:Date.now()});
+   };
+   if(previousReq){previousReq.onsuccess=()=>apply(previousReq.result);previousReq.onerror=()=>fail(tx.error)}else full();
+  };
+  metaReq.onerror=()=>fail(tx.error);
+  tx.oncomplete=()=>{if(!finished){finished=true;resolve(true)}};
+  tx.onabort=()=>{if(needsFull&&!finished){finished=true;void ensureEmaSeries(key,rows,db).then(()=>resolve(true),reject)}else if(!finished)fail(tx.error)};
+  tx.onerror=()=>{if(!needsFull)fail(tx.error)};
+ });
+}
+export function createGateKlineController({frame,instruments=[],onState=()=>{},isHidden=()=>document.hidden,requestTimeoutMs=GATE_REQUEST_TIMEOUT_MS}={}){
+ let dbp=null,dbRetryAt=0,lastPongAt=0,wsWatchdogTimer=0,cacheRetryTimer=0;
+ const memoryCache=new Map(),memoryCacheIncomplete=new Set(),bySymbol=new Map(instruments.map(x=>[x.symbol,x]));
+ async function getDB(){
+  if(dbp)return dbp;
+  if(Date.now()<dbRetryAt)return null;
+  dbp=openDB().catch(error=>{dbRetryAt=Date.now()+15000;dbp=null;onState({status:"cache-unavailable",mode:"memory-fallback",retryInMs:15000,error:String(error?.message||error)});return null;});
+  return dbp;
+ }
+ function markDBUnavailable(error){
+  dbRetryAt=Date.now()+15000;const pending=dbp;dbp=null;
+  if(pending)void pending.then(db=>db?.close()).catch(()=>{});
+  if(!cacheRetryTimer)cacheRetryTimer=setTimeout(()=>{cacheRetryTimer=0;startHistoryQueue(true)},15000);
+  onState({status:"cache-unavailable",mode:"memory-fallback",retryInMs:15000,error:String(error?.message||error)});
+ }
+ async function updateEmaCache(key,rows,full=false){
+  try{
+   const db=await getDB();
+   return full?await ensureEmaSeries(key,rows,db):await updateLatestEma(key,rows,db);
+  }catch(error){
+   markDBUnavailable(error);
+   onState({status:"ema-cache-write-failed",key,error:String(error?.message||error)});
+   return false;
+  }
+ }
+ let symbol="",contract="",timeframe="4H",candles=[],complete=false,ws=null,retryTimer=0,pingTimer=0,stopped=false,selection=0,wsSubscription=null,writeTimer=0,loadedKey="";
+ const pendingWrites=new Map(),requestControllers=new Set(),latestJobs=new Map(),latestCheckedAt=new Map(),backfillJobs=new Set();
+ let queueRunning=false,queueRestartRequested=false,paused=false,historyRetryTimer=0;
+ const completed=new Set(),failed=new Map(),retryAttempts=new Map(),retryDueAt=new Map();
+ let repairTasksLoaded=false,repairTasksLoading=null;
+ let forceLatestSweep=false;
+ const canWork=()=>!stopped&&!paused&&!isHidden();
+ function trimMemoryCache(){
+  while(memoryCache.size>8){let victim=null,oldest=Infinity;for(const [key,value] of memoryCache){if((value.updatedAt||0)<oldest){oldest=value.updatedAt||0;victim=key}}if(victim===null)break;memoryCache.delete(victim);memoryCacheIncomplete.add(victim)}
+ }
+ function putMemory(key,previous,rows,done,status,error){
+  const data=merge(previous.candles,rows),boundary=!memoryCacheIncomplete.has(key)&&(done===true||previous.historyBoundaryReached===true),gap=(status==="latest-verified")?"clear":(["latest-data-updated","history-gap-pending","failed","paused"].includes(status)?"pending":(previous.latestGapStatus||"pending"));
+  memoryCache.set(key,{id:key,source:"Gate USDT perpetual",updatedAt:Date.now(),schemaVersion:3,historyComplete:boundary&&gap==="clear",historyBoundaryReached:boundary,historyBoundaryStatus:boundary?("gate-api-empty-page-confirmed"):"not-yet-confirmed",latestGapStatus:gap,requestStatus:status,lastError:error??previous.lastError??null,candleCount:data.length,oldestTimestamp:data[0]?.t??null,newestTimestamp:data.at(-1)?.t??null,candles:data,cacheMode:"memory"});
+  trimMemoryCache();
+ }
+ async function read(key){
+  const db=await getDB();if(!db)return memoryCache.get(key)||{candles:[],historyBoundaryReached:false,latestGapStatus:"pending",cacheMode:"memory"};
+  return new Promise((resolve,reject)=>{let tx;try{tx=db.transaction([LEGACY_STORE,STORE,META_STORE],"readwrite")}catch(e){reject(e);return}
+   const legacyStore=tx.objectStore(LEGACY_STORE),rowsStore=tx.objectStore(STORE),metaStore=tx.objectStore(META_STORE),legacyReq=legacyStore.get(key),rowsReq=rowsStore.index("series").getAll(key),metaReq=metaStore.get(key);
+   let legacy=null,rows=[],meta=null,ready=0,result=null;
+   const finish=()=>{if(++ready!==3)return;const oldRows=legacy?.candles||[];if(legacy){for(const c of oldRows)rowsStore.put({id:key+"|"+c.t,series:key,...c});legacyStore.delete(key);const {candles:discardedLegacyArray,...legacyMeta}=legacy;metaStore.put({...legacyMeta,id:key,schemaVersion:3,candleCount:oldRows.length,cacheMode:"indexeddb"})}
+    const normalized=rows.map(({id,series,...c})=>c),volatile=memoryCache.get(key);result={...(meta||legacy||{historyBoundaryReached:false,latestGapStatus:"pending"}),candles:merge(normalized,oldRows,volatile?.candles),historyBoundaryReached:meta?.historyBoundaryReached===true||legacy?.historyBoundaryReached===true||volatile?.historyBoundaryReached===true,latestGapStatus:volatile?.latestGapStatus||meta?.latestGapStatus||legacy?.latestGapStatus||"pending",cacheMode:"indexeddb"};if(legacy){memoryCache.delete(key);memoryCacheIncomplete.delete(key)}};
+   legacyReq.onsuccess=()=>{legacy=legacyReq.result||null;finish()};rowsReq.onsuccess=()=>{rows=rowsReq.result||[];finish()};metaReq.onsuccess=()=>{meta=metaReq.result||null;finish()};
+   legacyReq.onerror=rowsReq.onerror=metaReq.onerror=()=>{try{tx.abort()}catch(_){}};tx.oncomplete=()=>resolve(result||{candles:[],historyBoundaryReached:false,latestGapStatus:"pending"});tx.onerror=tx.onabort=()=>reject(tx.error||new Error("IndexedDB cache read/migration failed"))
+  }).catch(error=>{
+   const fallback=memoryCache.get(key);
+   markDBUnavailable(error);
+   onState({status:"cache-read-failed",key,mode:"memory-fallback",error:String(error?.message||error)});
+   return fallback||{candles:[],historyBoundaryReached:false,latestGapStatus:"pending",cacheMode:"memory",lastError:String(error?.message||error)};
+  })
+ }
+ async function checkStorage(){if(Date.now()-storageCheckAt<300000||!navigator.storage?.estimate)return;storageCheckAt=Date.now();try{const e=await navigator.storage.estimate(),usage=Number(e.usage)||0,quota=Number(e.quota)||0,ratio=quota?usage/quota:0;if(ratio>=.8)onState({status:"cache-storage-pressure",usageBytes:usage,quotaBytes:quota,usageRatio:ratio,level:ratio>=.9?"critical":"warning"})}catch(_){}}
+ async function persistRepairTask(key,error,attempt,kind="history"){
+  const db=await getDB();if(!db)return false;
+  return new Promise((resolve,reject)=>{
+   let tx;try{tx=db.transaction([META_STORE],"readwrite")}catch(e){reject(e);return}
+   tx.objectStore(META_STORE).put({id:"repairTask|"+key,key,kind,status:"pending",error:String(error||""),attempt,nextRetryAt:Date.now()+historyRetryDelay(attempt),updatedAt:Date.now()});
+   tx.oncomplete=()=>resolve(true);tx.onerror=tx.onabort=()=>reject(tx.error||new Error("Repair task persistence failed"));
+  });
+ }
+ async function clearRepairTask(key,kind=null){
+  const db=await getDB();if(!db)return false;
+  return new Promise((resolve,reject)=>{
+   let tx,removed=false;try{tx=db.transaction([META_STORE],"readwrite")}catch(e){reject(e);return}
+   const store=tx.objectStore(META_STORE),req=store.get("repairTask|"+key);
+   req.onsuccess=()=>{if(req.result&&(!kind||req.result.kind===kind)){store.delete("repairTask|"+key);removed=true}};
+   req.onerror=()=>{try{tx.abort()}catch(_){}};
+   tx.oncomplete=()=>{if(removed)retryDueAt.delete(key);resolve(removed)};tx.onerror=tx.onabort=()=>reject(tx.error||new Error("Repair task cleanup failed"));
+  });
+ }
+ async function restoreRepairTasks(){
+  if(repairTasksLoaded)return;
+  if(repairTasksLoading)return repairTasksLoading;
+  repairTasksLoading=(async()=>{
+   const db=await getDB();if(!db)return;
+   const tasks=await new Promise((resolve,reject)=>{let tx;try{tx=db.transaction([META_STORE],"readonly")}catch(error){reject(error);return}const req=tx.objectStore(META_STORE).getAll();req.onsuccess=()=>resolve(req.result||[]);req.onerror=()=>reject(tx.error||new Error("Repair task recovery read failed"));tx.onerror=tx.onabort=()=>reject(tx.error||new Error("Repair task recovery transaction failed"))});
+   for(const task of tasks){if(!String(task?.id||"").startsWith("repairTask|")||!task.key)continue;failed.set(task.key,String(task.error||"Previous repair attempt failed"));retryAttempts.set(task.key,Math.max(0,Number(task.attempt)||0));retryDueAt.set(task.key,Math.max(Date.now(),Number(task.nextRetryAt)||Date.now()))}
+   repairTasksLoaded=true;
+   if(failed.size)onState({status:"repair-tasks-restored",count:failed.size,keys:[...failed.keys()]});
+  })().finally(()=>{repairTasksLoading=null});
+  return repairTasksLoading;
+ }
+ function scheduleHistoryRetry(){
+  if(historyRetryTimer||stopped||!failed.size)return;
+  const now=Date.now(),due=[...retryDueAt.values()].filter(Number.isFinite);
+  const delay=due.length?Math.max(1000,Math.min(...due)-now):historyRetryDelay(Math.max(0,...retryAttempts.values()));
+  historyRetryTimer=setTimeout(()=>{historyRetryTimer=0;startHistoryQueue(true)},delay);
+ }
+ async function write(key,rows,done,status="ok",error=null){
+  const volatile=memoryCache.get(key);rows=merge(volatile?.candles,rows);if(memoryCacheIncomplete.has(key))done=false;
+  const db=await getDB();if(!db){putMemory(key,volatile||{},rows,done,status,error);if(!cacheRetryTimer)cacheRetryTimer=setTimeout(()=>{cacheRetryTimer=0;startHistoryQueue(true)},15000);onState({status:"cache-write-failed",key,mode:"memory-fallback",error:"IndexedDB unavailable; kept latest rows in memory"});return}
+  try{await new Promise((resolve,reject)=>{let tx;try{tx=db.transaction([LEGACY_STORE,STORE,META_STORE],"readwrite")}catch(e){reject(e);return}
+   const legacyStore=tx.objectStore(LEGACY_STORE),rowsStore=tx.objectStore(STORE),metaStore=tx.objectStore(META_STORE),legacyReq=legacyStore.get(key),metaReq=metaStore.get(key);let lr=false,mr=false,failed=false,applied=false;
+   const fail=e=>{if(failed)return;failed=true;try{tx.abort()}catch(_){}reject(e||new Error("IndexedDB cache write failed"))};
+   const apply=()=>{if(!lr||!mr||failed||applied)return;applied=true;const previous=metaReq.result||legacyReq.result||{},legacy=legacyReq.result;
+    if(legacy){for(const row of legacy.candles||[])rowsStore.put({id:key+"|"+row.t,series:key,...row});legacyStore.delete(key)}
+    let pending=rows.length,metadataStarted=false;
+    const finishRows=()=>{if(pending||metadataStarted||failed)return;metadataStarted=true;
+     const idx=rowsStore.index("series"),cr=idx.count(key),fr=idx.openCursor(IDBKeyRange.only(key),"next"),rr=idx.openCursor(IDBKeyRange.only(key),"prev");let count,first,last,cd=false,fd=false,rd=false;
+     const save=()=>{if(!cd||!fd||!rd)return;const boundary=done===true||previous.historyBoundaryReached===true,gap=status==="latest-verified"?"clear":(["latest-data-updated","history-gap-pending","failed","paused"].includes(status)?"pending":(previous.latestGapStatus||"pending"));metaStore.put({id:key,source:"Gate USDT perpetual",updatedAt:Date.now(),schemaVersion:3,historyComplete:boundary&&gap==="clear",historyBoundaryReached:boundary,historyBoundaryStatus:boundary?"gate-api-empty-page-confirmed":"not-yet-confirmed",latestGapStatus:gap,requestStatus:status,lastError:error??(status==="failed"?previous.lastError:null),candleCount:count,oldestTimestamp:first?.value?.t??null,newestTimestamp:last?.value?.t??null,cacheMode:"indexeddb"})};
+     cr.onsuccess=()=>{count=cr.result;cd=true;save()};fr.onsuccess=()=>{first=fr.result;fd=true;save()};rr.onsuccess=()=>{last=rr.result;rd=true;save()};cr.onerror=fr.onerror=rr.onerror=()=>fail(new Error("IndexedDB cache index update failed"));
+    };
+    if(!pending)finishRows();
+    for(const row of rows){const id=key+"|"+row.t,req=rowsStore.get(id);req.onsuccess=()=>{const old=req.result;if(!old||old.o!==row.o||old.h!==row.h||old.l!==row.l||old.c!==row.c)rowsStore.put({id,series:key,...row});pending--;finishRows()};req.onerror=()=>fail(req.error||tx.error)}
+   };
+   legacyReq.onsuccess=()=>{lr=true;apply()};metaReq.onsuccess=()=>{mr=true;apply()};legacyReq.onerror=metaReq.onerror=()=>fail(tx.error);tx.oncomplete=()=>{memoryCache.delete(key);memoryCacheIncomplete.delete(key);resolve()};tx.onerror=tx.onabort=()=>fail(tx.error||new Error("IndexedDB write transaction failed"))
+  })}catch(error){putMemory(key,memoryCache.get(key)||{},rows,done,status,String(error?.message||error));markDBUnavailable(error);onState({status:"cache-write-failed",key,mode:"memory-fallback",error:String(error?.message||error)});return}
+  void checkStorage()
+ } function scheduleWrite(key,rows,done,status="ok",error=null){pendingWrites.set(key,mergePendingWriteRows(pendingWrites.get(key),{rows:rows.slice(),done,status,error}));if(!writeTimer)writeTimer=setTimeout(()=>{void flushPendingWrites()},750)}
+ async function flushPendingWrites(){if(writeTimer){clearTimeout(writeTimer);writeTimer=0}const jobs=[...pendingWrites.entries()];pendingWrites.clear();await Promise.all(jobs.map(async([key,p])=>{try{await write(key,p.rows,p.done,p.status,p.error,true);const snapshot=await read(key);await updateEmaCache(key,snapshot.candles)}catch(error){onState({status:"cache-write-failed",key,error:String(error?.message||error)})}}))}
+ function mergeLive(rows,incoming){for(const item of incoming){const last=rows[rows.length-1];if(!last||item.t>last.t){rows.push(item);continue}if(item.t===last.t){rows[rows.length-1]=item;continue}const index=rows.findIndex(row=>row.t===item.t);if(index>=0)rows[index]=item;else{rows.push(item);rows.sort((a,b)=>a.t-b.t)}}return rows}
+ async function request(url,tf){
+  let lastError;
+  for(let attempt=0;attempt<5;attempt++){
+   if(!canWork())throw new Error("History request paused");
+   const controller=new AbortController();
+   requestControllers.add(controller);
+   const timeout=setTimeout(()=>controller.abort("gate-request-timeout"),Math.max(1,Number(requestTimeoutMs)||GATE_REQUEST_TIMEOUT_MS));
+   try{
+    const res=await fetch(url,{headers:{Accept:"application/json"},cache:"no-store",signal:controller.signal});
+    if(res.status===429||res.status>=500){const error=new Error("Gate HTTP "+res.status);error.retryable=true;throw error}
+    if(!res.ok)throw new Error("Gate HTTP "+res.status);
+    const body=await res.json();
+    if(!Array.isArray(body))throw new Error("Gate returned non-array candlesticks");
+    return normalize(body,tf);
+   }catch(error){
+    lastError=error;
+    const timedOut=controller.signal.aborted&&controller.signal.reason==="gate-request-timeout";
+    if(!canWork()||(controller.signal.aborted&&!timedOut))throw error;
+    const retryable=timedOut||error?.retryable===true||error instanceof TypeError;
+    if(!retryable||attempt===4)break;
+    await new Promise(r=>setTimeout(r,Math.min(8000,1000*2**attempt)));
+   }finally{
+    clearTimeout(timeout);
+    requestControllers.delete(controller);
+   }
+  }
+  throw lastError||new Error("Gate history request failed");
+ }
+ async function latest(c,n,tf){if(tf==="2H"){const count=Math.min(2000,Math.max(4,n*2+2)),u=API+"/candlesticks?contract="+encodeURIComponent(c)+"&interval=1h&limit="+count;return aggregate2H(await request(u,"1H"))}const timezone=tf==="D"?"&timezone=utc8":"";const u=API+"/candlesticks?contract="+encodeURIComponent(c)+"&interval="+INTERVALS[tf]+"&limit="+n+timezone;return merge(await request(u,tf))}
+ async function older(c,tf,oldest){if(tf==="2H"){const step=3600,from=Math.max(0,oldest-PAGE*step),to=Math.max(0,oldest-1);if(to<=from)return [];const u=API+"/candlesticks?contract="+encodeURIComponent(c)+"&interval=1h&from="+from+"&to="+to;return aggregate2H(await request(u,"1H"))}const step=MS[tf]/1000,from=Math.max(0,oldest-PAGE*step),to=Math.max(0,oldest-1),timezone=tf==="D"?"&timezone=utc8":"";if(to<=from)return [];const u=API+"/candlesticks?contract="+encodeURIComponent(c)+"&interval="+INTERVALS[tf]+"&from="+from+"&to="+to+timezone;return merge(await request(u,tf))}
+ async function range(c,tf,from,to){if(tf==="2H"){let rows=[];for(const window of twoHourRangeWindows(from,to)){if(!canWork())break;const u=API+"/candlesticks?contract="+encodeURIComponent(c)+"&interval=1h&from="+window.from+"&to="+window.to,part=await request(u,"1H");if(!canWork())break;if(!part.length)throw new Error("Gate history gap could not be filled");rows=merge(rows,aggregate2H(part))}return rows}const step=MS[tf]/1000;let cursor=Math.max(0,from),rows=[];while(cursor<=to&&canWork()){const end=Math.min(to,cursor+(PAGE-1)*step),timezone=tf==="D"?"&timezone=utc8":"",u=API+"/candlesticks?contract="+encodeURIComponent(c)+"&interval="+INTERVALS[tf]+"&from="+cursor+"&to="+end+timezone,part=await request(u,tf);if(!canWork())break;if(!part.length)throw new Error("Gate history gap could not be filled");rows=merge(rows,part);const next=part[part.length-1].t+step;if(next<=cursor)throw new Error("Gate gap repair pagination stalled");cursor=next}return rows}
+ function isActive(c,tf){return !stopped&&c===contract&&tf===timeframe}
+ function render(rows,token=selection,tf=timeframe,emaValues=null,deferEma=false){if(stopped||token!==selection||tf!==timeframe)return;const w=frame?.contentWindow;if(!w)return;w.setCandles?.(rows);if(emaValues)w.setVegasEmaCandles?.(rows,emaValues);else if(deferEma)w.setVegasEmaCandles?.([],{});else w.setVegasEmaCandles?.(rows);w.setHistoryStatus?.(symbol,rows.length,complete,complete?"ready":"loading","",tf)}
+ async function repairGaps(c,tf,source){
+  let rows=source,guard=0;const key=keyOf(c,tf);
+  while(canWork()&&guard++<10000){
+   const gap=findCandleGaps(rows,tf)[0];
+   if(!gap)break;
+   if(gap.misaligned||gap.missingCount<1)throw new Error("Gate history contains misaligned candle timestamps");
+   const added=await range(c,tf,gap.from,gap.to);
+   if(!canWork())return rows;
+   const next=merge(rows,added);
+   if(next.length===rows.length)throw new Error("Gate history gap remains unresolved");
+   rows=next;await write(key,added,false);if(dbRetryAt>Date.now())return rows;
+   if(isActive(c,tf)){candles=rows;loadedKey=keyOf(c,tf);complete=false;render(rows,selection,tf)}
+  }
+  if(guard>=10000)throw new Error("Gate history gap repair limit reached");
+  if(!canWork())return rows;
+  if(rows.length){
+   const step=MS[tf]/1000,expected=expectedLatestCandleTimestamp(tf),last=rows[rows.length-1].t;
+   if(last<expected){
+    const from=last+step,to=expected+step-1;
+    const added=await range(c,tf,from,to);
+    if(!canWork())return rows;
+    const next=merge(rows,added);
+    if(next.length===rows.length||next[next.length-1].t<expected)throw new Error("Gate latest candle gap could not be filled");
+    rows=next;await write(key,added,false,"latest-tail-repaired");
+    if(isActive(c,tf)){candles=rows;complete=false;render(candles,selection,tf)}
+   }
+  }
+  return rows
+ }
+ function sendSubscription(event,sub){if(!ws||ws.readyState!==WebSocket.OPEN||!sub)return;ws.send(JSON.stringify({time:Math.floor(Date.now()/1000),channel:"futures.candlesticks",event,payload:[INTERVALS[sub.timeframe],sub.contract]}))}
+ function setSubscription(){if(!canWork()||!contract||!ws||ws.readyState!==WebSocket.OPEN)return;const next={contract,timeframe};if(wsSubscription&&wsSubscription.contract===next.contract&&wsSubscription.timeframe===next.timeframe)return;if(wsSubscription)sendSubscription("unsubscribe",wsSubscription);wsSubscription=null;if(timeframe==="2H"||timeframe==="D")return;sendSubscription("subscribe",next);wsSubscription=next}
+ function closeWS(){if(retryTimer)clearTimeout(retryTimer);if(pingTimer)clearInterval(pingTimer);if(wsWatchdogTimer)clearInterval(wsWatchdogTimer);retryTimer=pingTimer=wsWatchdogTimer=0;const old=ws;if(old){sendSubscription("unsubscribe",wsSubscription);old.onclose=null;try{old.close()}catch(_){}}ws=null;wsSubscription=null}
+ function current(token=selection){return !stopped&&token===selection}
+ function subscribe(){if(!canWork()||!contract||timeframe==="2H"||timeframe==="D")return;if(!ws){try{const socket=new WebSocket(WS_URL);ws=socket;socket.onopen=()=>{if(ws!==socket||!canWork())return;lastPongAt=Date.now();pingTimer=setInterval(()=>{if(ws===socket&&socket.readyState===WebSocket.OPEN)socket.send(JSON.stringify({time:Math.floor(Date.now()/1000),channel:"futures.ping"}))},20000);wsWatchdogTimer=setInterval(()=>{if(ws===socket&&socket.readyState===WebSocket.OPEN&&Date.now()-lastPongAt>65000){try{socket.close()}catch(_){}}},20000);wsSubscription=null;setSubscription()};socket.onmessage=e=>{if(ws!==socket||!canWork())return;let message;try{message=JSON.parse(e.data)}catch(_){return}if(message.channel==="futures.pong"||message.event==="pong"){lastPongAt=Date.now();return}if(message.channel!=="futures.candlesticks"||message.event!=="update"||!Array.isArray(message.result))return;const first=message.result[0],identity=String(first?.n||""),separator=identity.indexOf("_");const rawInterval=separator>0?identity.slice(0,separator):first?.i||first?.interval;const rawContract=separator>0?identity.slice(separator+1):first?.contract;if(rawContract!==contract||rawInterval!==INTERVALS[timeframe])return;const incoming=normalize(message.result,timeframe);if(!incoming.length)return;const token=selection,c=contract,tf=timeframe;candles=mergeLive(candles,incoming);loadedKey=keyOf(c,tf);scheduleWrite(keyOf(c,tf),incoming,complete);render(candles,token,tf)};socket.onclose=()=>{if(ws===socket){ws=null;wsSubscription=null;if(pingTimer)clearInterval(pingTimer);if(wsWatchdogTimer)clearInterval(wsWatchdogTimer);pingTimer=wsWatchdogTimer=0;if(canWork())retryTimer=setTimeout(subscribe,3000)}};socket.onerror=()=>{try{socket.close()}catch(_){}}}catch(_){retryTimer=setTimeout(subscribe,5000);return}}setSubscription()}
+ async function runBackfillPeriod(c,tf){
+  const key=keyOf(c,tf),cached=await read(key);
+  if(!canWork())return;
+  if(cached.historyBoundaryReached===true&&cached.latestGapStatus==="clear"){
+  const fresh=await latest(c,3,tf);
+  if(!canWork())return;
+  let verified=merge(cached.candles,fresh);
+  if(fresh.length)await write(key,fresh,true,"latest-data-updated");
+  verified=await repairGaps(c,tf,verified);
+  if(!canWork()){await write(key,[],true,"paused");return}
+  if(!hasLatestCoverage(verified,tf))throw new Error("Latest Gate candle coverage is stale or incomplete");
+  await write(key,[],true,"latest-verified");
+  const emaValues=await updateEmaCache(key,verified,true);
+  if(isActive(c,tf)){candles=verified;loadedKey=keyOf(c,tf);complete=true;render(verified,selection,tf,emaValues)}
+  completed.add(key);failed.delete(key);return;
+ }
+  let rows=merge(cached.candles),done=cached.historyBoundaryReached===true;
+  const fresh=await latest(c,rows.length?3:PAGE,tf);
+  if(!canWork())return;
+  rows=merge(rows,fresh);
+  if(!rows.length)throw new Error("Gate returned no historical candles for "+c+" "+tf);
+  await write(key,fresh,done);if(dbRetryAt>Date.now())return;
+  const before=rows.length;
+  rows=await repairGaps(c,tf,rows);
+  if(!canWork()){await write(key,[],false,"paused");return}
+  if(!hasLatestCoverage(rows,tf))throw new Error("Latest Gate candle coverage is stale or incomplete");
+  if(rows.length!==before)done=false;
+  await write(key,[],done,fresh.length?"latest-verified":"history-backfill");if(dbRetryAt>Date.now())return;
+  if(isActive(c,tf)){candles=rows;loadedKey=keyOf(c,tf);complete=done;render(rows,selection,tf)}
+  if(done){const emaValues=await updateEmaCache(key,rows,true);if(isActive(c,tf))render(rows,selection,tf,emaValues||undefined);completed.add(key);failed.delete(key);return}
+  while(canWork()&&rows.length){
+   let page=await older(c,tf,rows[0].t);
+   if(!canWork()){await write(key,rows,false,"paused");return}
+   if(!page.length){
+    // Confirm an empty historical page independently before declaring the exchange history boundary.
+    page=await older(c,tf,rows[0].t);
+    if(!canWork()){await write(key,rows,false,"paused");return}
+    if(!page.length){done=true;await write(key,[],true,"history-boundary-reached");if(dbRetryAt>Date.now())return;break}
+   }
+   const old=rows[0].t,next=page[0].t;
+   if(next>=old)throw new Error("Gate history pagination did not move backward");
+   rows=merge(rows,page);await write(key,page,false);if(dbRetryAt>Date.now())return;
+   rows=await repairGaps(c,tf,rows);
+   if(!canWork()){await write(key,rows,false,"paused");return}
+   if(isActive(c,tf)){candles=rows;loadedKey=keyOf(c,tf);complete=false;render(rows,selection,tf)}
+   // A short page is not proof of the oldest history boundary. Probe the next earlier window; only an empty successful page confirms the boundary.
+  }
+  const emaValues=await updateEmaCache(key,rows,true);
+  if(done){completed.add(key);failed.delete(key)}
+  if(isActive(c,tf)){candles=rows;loadedKey=keyOf(c,tf);complete=done;render(rows,selection,tf,emaValues);onState({symbol,contract:c,timeframe:tf,count:rows.length,historyComplete:done,status:done?"history-boundary-reached":"paused"})}
+ }
+ async function backfillPeriod(c,tf){const key=keyOf(c,tf);if(backfillJobs.has(key))return;backfillJobs.add(key);try{return await runBackfillPeriod(c,tf)}finally{backfillJobs.delete(key)}}
+ async function runHistoryQueue(){
+  if(!canWork())return;
+  if(queueRunning){if(forceLatestSweep)queueRestartRequested=true;return;}
+  queueRunning=true;
+  try{
+   const persistentDB=await getDB();
+   if(!persistentDB){if(!cacheRetryTimer)cacheRetryTimer=setTimeout(()=>{cacheRetryTimer=0;startHistoryQueue(true)},15000);onState({status:"history-backfill-paused",reason:"indexeddb-unavailable"});return;}
+   const active=instruments.find(item=>item.symbol===symbol),ordered=active?[active,...instruments.filter(item=>item!==active)]:instruments;
+   const periods=[timeframe,...TIMEFRAMES.filter(tf=>tf!==timeframe)];
+   for(const item of ordered){
+    for(const tf of periods){
+     if(!canWork())break;
+     const key=keyOf(item.gateContract||item.contract,tf);
+     if(completed.has(key)&&!forceLatestSweep)continue;
+     if(failed.has(key)&&(retryDueAt.get(key)||0)>Date.now())continue;
+     const c=item.gateContract||item.contract;
+     try{
+      await backfillPeriod(c,tf);
+      if(dbRetryAt>Date.now())break;
+      if(completed.has(key)){
+       failed.delete(key);retryAttempts.delete(key);retryDueAt.delete(key);
+       try{await clearRepairTask(key)}catch(error){onState({status:"repair-task-cleanup-failed",key,error:String(error?.message||error)})}
+      }
+     }catch(error){
+      if(!canWork())break;
+      const message=String(error?.message||error),attempt=(retryAttempts.get(key)||0)+1;
+      retryAttempts.set(key,attempt);failed.set(key,message);retryDueAt.set(key,Date.now()+historyRetryDelay(attempt));
+      try{
+       const snapshot=await read(key);
+       await write(key,[],false,"failed",message);
+       await ensureEmaSeries(key,snapshot.candles,await getDB());
+       await persistRepairTask(key,message,attempt);
+      }catch(persistError){onState({status:"repair-task-persist-failed",key,error:String(persistError?.message||persistError)})}
+      if(isActive(c,tf))onState({symbol:item.symbol,contract:c,timeframe:tf,status:"request-failed",error:message});
+     }
+     if(canWork())await new Promise(resolve=>setTimeout(resolve,60));
+    }
+    if(!canWork()||dbRetryAt>Date.now())break;
+   }
+  }finally{
+   queueRunning=false;
+   if(queueRestartRequested&&canWork()){queueRestartRequested=false;void runHistoryQueue()}
+   else if(canWork()){
+    forceLatestSweep=false;
+    if(failed.size)scheduleHistoryRetry();
+    else if(historyRetryTimer){clearTimeout(historyRetryTimer);historyRetryTimer=0}
+   }
+  }
+ }
+ function startHistoryQueue(forceLatest=false){if(stopped||paused||isHidden())return;if(forceLatest){forceLatestSweep=true;if(historyRetryTimer){clearTimeout(historyRetryTimer);historyRetryTimer=0}}if(queueRunning){if(forceLatest)queueRestartRequested=true;return;}void restoreRepairTasks().catch(error=>onState({status:"repair-task-recovery-failed",error:String(error?.message||error)})).finally(()=>{if(!stopped&&!paused&&!isHidden())void runHistoryQueue()})}
+ async function updateLatest(c,tf,token,force=false){
+  const key=keyOf(c,tf),last=latestCheckedAt.get(key)||0;
+  if(!force&&Date.now()-last<60000)return true;
+  if(latestJobs.has(key))return latestJobs.get(key);
+  const job=(async()=>{
+   const cached=await read(key);if(!canWork())return false;
+   const freshRows=await latest(c,cached.candles?.length?3:PAGE,tf);if(!freshRows.length)throw new Error("Latest market data request returned empty");if(!canWork())return false;
+   const base=isActive(c,tf)?candles:cached.candles;
+   let merged=merge(base,freshRows);
+   await write(key,freshRows,cached.historyBoundaryReached===true,"latest-data-updated");
+   await updateEmaCache(key,merged);
+   latestCheckedAt.set(key,Date.now());
+   if(isActive(c,tf)&&current(token)){
+    const saved=await read(key);candles=merge(saved.candles);if(candles.length)loadedKey=key;complete=saved.historyComplete===true;render(candles,token,tf);
+    onState({symbol,contract:c,timeframe:tf,count:candles.length,historyComplete:complete,status:"latest-updated"});
+   }
+   try{
+    const repaired=await repairGaps(c,tf,merged);
+    if(!canWork())return true;
+    if(!hasLatestCoverage(repaired,tf))throw new Error("Latest Gate candle coverage is stale or incomplete");
+    if(repaired.length!==merged.length){
+     await write(key,[],cached.historyBoundaryReached===true,"latest-verified");
+     await updateEmaCache(key,repaired);
+     if(isActive(c,tf)&&current(token)){candles=merge(repaired);loadedKey=key;render(candles,token,tf)}
+    }else{
+     await write(key,repaired,cached.historyBoundaryReached===true,"latest-verified");
+    }
+    let clearedLatestTask=false;
+    try{clearedLatestTask=await clearRepairTask(key,"latest")}catch(error){onState({status:"repair-task-cleanup-failed",key,error:String(error?.message||error)})}
+    if(clearedLatestTask){failed.delete(key);retryAttempts.delete(key);retryDueAt.delete(key)}
+    onState({symbol,contract:c,timeframe:tf,status:"latest-gap-repaired",count:repaired.length});
+   }catch(error){
+    const savedAfterRepair=await read(key);
+    const message=String(error?.message||error),attempt=(retryAttempts.get(key)||0)+1,nextRetryAt=Date.now()+historyRetryDelay(attempt);
+    retryAttempts.set(key,attempt);retryDueAt.set(key,nextRetryAt);failed.set(key,message);
+    await write(key,[],cached.historyBoundaryReached===true,"history-gap-pending",message);
+    await updateEmaCache(key,savedAfterRepair.candles);
+    try{await persistRepairTask(key,message,attempt,"latest")}catch(persistError){onState({status:"repair-task-persist-failed",key,error:String(persistError?.message||persistError)})}
+    scheduleHistoryRetry();
+    if(isActive(c,tf)&&current(token)){candles=merge(savedAfterRepair.candles);if(candles.length)loadedKey=key;render(candles,token,tf);onState({symbol,contract:c,timeframe:tf,status:"history-gap-pending",error:message});}
+   }
+   if(!cached.candles?.length&&!completed.has(key)){if(queueRunning)queueRestartRequested=true;else startHistoryQueue();}
+   return true;
+  })().catch(async error=>{const message=String(error?.message||error);try{const snapshot=await read(key);await write(key,snapshot.candles,false,"failed",message)}catch(_){}if(isActive(c,tf)&&current(token))onState({symbol,contract:c,timeframe:tf,status:"latest-refresh-failed",error:message});return false}).finally(()=>latestJobs.delete(key));
+  latestJobs.set(key,job);return job;
+ }
+ async function select(nextSymbol,nextContract,tf=timeframe,forceLatest=false){
+  if(stopped)return false;
+  if(!TIMEFRAMES.includes(tf))throw new Error("Unsupported timeframe: "+tf);
+  const item=bySymbol.get(nextSymbol),c=nextContract||item?.gateContract||item?.contract;
+  if(!c)throw new Error("A Gate USDT perpetual contract is required");
+  selection++;const token=selection;symbol=nextSymbol;contract=c;timeframe=tf;complete=false;setSubscription();
+  frame?.contentWindow?.migrateLegacyViewportKey?.(keyOf(c,tf));
+  try{
+   const cached=await read(keyOf(c,tf));if(!current(token)||!canWork())return false;
+   candles=merge(cached.candles);if(candles.length)loadedKey=keyOf(c,tf);complete=cached.historyComplete===true;render(candles,token,tf,null,true);
+   onState({symbol,contract,timeframe,count:candles.length,historyComplete:complete,status:"cache-loaded"});
+   const cachedEma=await readEmaSeries(keyOf(c,tf),candles,await getDB());
+   if(!current(token)||!canWork())return false;
+   if(candles.length)frame?.contentWindow?.setVegasEmaCandles?.(candles,cachedEma||undefined);
+   subscribe();
+   // Fetch/render the active series independently before background full-history pagination.
+   await updateLatest(c,tf,token,forceLatest);
+   if(!current(token)||!canWork())return false;
+   startHistoryQueue(forceLatest);
+   return candles.length>0
+  }catch(e){if(current(token))onState({symbol,contract,timeframe,count:candles.length,historyComplete:complete,status:"cache-read-failed",error:String(e?.message||e)});return false}
+ }
+ async function refresh(){if(stopped||!contract||!canWork())return false;const key=keyOf(contract,timeframe);if(backfillJobs.has(key)||(queueRunning&&!completed.has(key)))return true;return updateLatest(contract,timeframe,selection,true)}
+ function suspend(){paused=true;if(historyRetryTimer){clearTimeout(historyRetryTimer);historyRetryTimer=0}if(cacheRetryTimer){clearTimeout(cacheRetryTimer);cacheRetryTimer=0}for(const controller of requestControllers)controller.abort("page-hidden");closeWS();void flushPendingWrites()}
+ function resume(){
+  if(stopped||isHidden())return;
+  paused=false;forceLatestSweep=true;
+  if(contract){
+   const resumeSymbol=symbol,resumeContract=contract,resumeTimeframe=timeframe;
+   const pending=latestJobs.get(keyOf(resumeContract,resumeTimeframe));
+   if(pending){
+    void pending.finally(()=>{
+     if(canWork()&&contract===resumeContract&&timeframe===resumeTimeframe)void select(resumeSymbol,resumeContract,resumeTimeframe,true);
+    });
+    return;
+   }
+   void select(resumeSymbol,resumeContract,resumeTimeframe,true);
+  }else startHistoryQueue(true);
+ }
+ function destroy(){if(stopped)return;stopped=true;paused=true;if(historyRetryTimer){clearTimeout(historyRetryTimer);historyRetryTimer=0}if(cacheRetryTimer){clearTimeout(cacheRetryTimer);cacheRetryTimer=0}selection++;for(const controller of requestControllers)controller.abort("controller-destroyed");closeWS();void flushPendingWrites()}
+ return Object.freeze({select,refresh,resume,suspend,destroy,get state(){const key=keyOf(contract,timeframe);return Object.freeze({symbol,contract,timeframe,count:candles.length,oldestTimestamp:candles[0]?.t??null,newestTimestamp:candles.at(-1)?.t??null,dataReady:loadedKey===key,historyComplete:complete,historyQueue:Object.freeze({running:queueRunning,completed:completed.size,total:instruments.length*TIMEFRAMES.length,failed:Object.fromEntries(failed)})})}});
+}
