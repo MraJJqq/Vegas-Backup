@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="./assets/css/v9-modules.css?v=v9-static-20261123-1">
 <link rel="stylesheet" href="./modules/timeframe-switch/host.css?v=v9-static-20261123-1">
 <link rel="stylesheet" href="./assets/css/full-screen-dynamic.css?v=v9-static-20261123-1">
+<link rel="stylesheet" href="./modules/signal-ticker/signal-ticker.css?v=v9-static-20261123-1">
 </head>
 <body>
 <main id="app">
@@ -20,9 +21,11 @@
   <iframe id="logo-frame" src="./modules/logo/logo.html?v=v9-local-kline-20261123-1" title="VEGAS Logo 模块" loading="eager" allowtransparency="true" onload="this.classList.add('is-ready')"></iframe>
   <iframe id="timeframe-frame" src="./modules/timeframe-switch/index.html?v=v9-timeframe-wheel-1" title="周期切换" loading="eager" allowtransparency="true" onload="this.classList.add('is-ready')"></iframe>
   <div id="rolling-cards-frame" aria-label="22张行情卡片滚动"><div id="ring"><div id="vp"></div></div></div>
+  <div id="signal-ticker" aria-live="polite" hidden></div>
 </main>
 <script src="./modules/shared/instrument-catalog.js?v=v9-static-20261123-1"></script>
 <script src="./cards/rolling-cards.js?v=v9-static-20261123-1" defer></script>
 <script type="module" src="./modules/v9-runtime.js?v=v9-local-kline-20261123-1"></script>
+<script type="module" src="./modules/signal-ticker/signal-ticker.js?v=v9-static-20261123-1"></script>
 </body>
 </html>
