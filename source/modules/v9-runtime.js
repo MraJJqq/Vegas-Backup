@@ -1,4 +1,5 @@
 import { createLifecycleScope } from "./shared/lifecycle.js";
+import { mountV9DrawingTools } from "./drawing-tools/v9-drawing-tools.js";
 import { createPageLifecycle } from "./shared/page-lifecycle-v9.js";
 import { INSTRUMENTS, GATE_CONTRACTS, createSessionQueue } from "./shared/universe-v9.js";
 import { createV9KlineView } from "../kline/v9-kline-view.js?v=v9-local-kline-20261123-1";
@@ -6,6 +7,7 @@ import { createGateKlineController } from "../kline/gate-kline-controller.js?v=v
 import { createKlineRotationPause } from "./kline-rotation-pause.js?v=v9-local-kline-20261123-1";
 
 const lifecycle=createLifecycleScope();
+try{localStorage.removeItem("vegas-v9-signal-lifecycle-v1")}catch(_){}
 let pageLifecycle=null;
 const isRuntimeHidden=()=>pageLifecycle?pageLifecycle.isSuspended():document.hidden;
 const app=document.getElementById("app"),rollingFrame=document.getElementById("rolling-cards-frame");
@@ -37,6 +39,26 @@ function setInteractionLock(source,active){
  interactionResumeTimer=setTimeout(()=>{interactionResumeTimer=null;if(!destroyed&&!isRuntimeHidden()&&!interactionLocks.size&&!userRotationPaused)scheduleSymbolRotation();},0);
 }
 const view=createV9KlineView({host:klineHost,onInteractionChange:setInteractionLock});
+const drawingTools=mountV9DrawingTools({app,onModeChange:active=>setInteractionLock("drawing-tools",active)});
+let drawingLayoutRefresh=null,drawingLayoutRefreshSecond=null;
+function refreshDrawingLayout(){
+ if(destroyed)return;
+ drawingLayoutRefresh?.();
+ drawingLayoutRefreshSecond?.();
+ // iOS rotation can report the new orientation before viewport geometry settles.
+ // Wait two animation frames so the shared layout and hit regions use final dimensions.
+ drawingLayoutRefresh=lifecycle.animationFrame(()=>{
+  drawingLayoutRefresh=null;
+  drawingLayoutRefreshSecond=lifecycle.animationFrame(()=>{
+   drawingLayoutRefreshSecond=null;
+   drawingTools.refreshLayout();
+  });
+ });
+}
+lifecycle.listen(window,"resize",refreshDrawingLayout,{passive:true});
+lifecycle.listen(window,"orientationchange",refreshDrawingLayout,{passive:true});
+if(window.screen?.orientation)lifecycle.listen(window.screen.orientation,"change",refreshDrawingLayout,{passive:true});
+if(window.visualViewport)lifecycle.listen(window.visualViewport,"resize",refreshDrawingLayout,{passive:true});
 function setUserRotationPaused(paused){
  if(userRotationPaused===paused)return;
  userRotationPaused=paused;
@@ -48,10 +70,10 @@ function setUserRotationPaused(paused){
  if(!destroyed&&!isRuntimeHidden()&&!interactionLocks.size&&!transitionActive)scheduleSymbolRotation();
 }
 const rotationPause=createKlineRotationPause({target:klineHost,onToggle:()=>setUserRotationPaused(!userRotationPaused)});
-const controller=createGateKlineController({frame:{contentWindow:view},instruments:GATE_INSTRUMENTS,isHidden:isRuntimeHidden,onState:s=>{if(s.status==="request-failed"||s.status==="cache-unavailable"||s.status==="cache-write-failed")console.warn("[VEGAS V9 data]",s);}});
+const controller=createGateKlineController({frame:{contentWindow:view},instruments:GATE_INSTRUMENTS,isHidden:isRuntimeHidden,onState:s=>{if(s.status==="gap-patrol-started"||s.status==="gap-patrol-completed")console.info("[VEGAS V9 K-line patrol]",s);if(s.status==="request-failed"||s.status==="cache-unavailable"||s.status==="cache-write-failed")console.warn("[VEGAS V9 data]",s);}});
 lifecycle.listen(window,"unhandledrejection",event=>console.error("[VEGAS V9 unhandled rejection]",event.reason));
 lifecycle.listen(window,"error",event=>console.error("[VEGAS V9 runtime error]",event.message,event.filename,event.lineno));
-function selectSymbol(symbol){const item=INSTRUMENTS.find(x=>x.symbol===symbol),contract=GATE_CONTRACTS[symbol];if(!item||!contract){console.warn("[VEGAS V9] Unknown symbol:",symbol);return false;}void controller.select(symbol,contract,timeframe);return true;}
+function selectSymbol(symbol,patrolOnOpen=false){const item=INSTRUMENTS.find(x=>x.symbol===symbol),contract=GATE_CONTRACTS[symbol];if(!item||!contract){console.warn("[VEGAS V9] Unknown symbol:",symbol);return false;}drawingTools.setSymbol(symbol);void controller.select(symbol,contract,timeframe,patrolOnOpen);return true;}
 function clearRotationTimers(){if(rotationTimer!==null){clearTimeout(rotationTimer);rotationTimer=null;}if(transitionTimer!==null){clearTimeout(transitionTimer);transitionTimer=null;}}
 function desiredTarget(){return queuedTarget||activeTarget||{symbolIndex:logoIndex,timeframe};}
 function beginTransition(target){
@@ -139,8 +161,8 @@ async function refreshCardQuotes(){
 function startForegroundTimers(){if(destroyed||isRuntimeHidden())return;if(!foregroundInterval)foregroundInterval=lifecycle.interval(()=>{refreshCardQuotes();void controller.refresh();},300000);}
 function stopForegroundTimers(){foregroundInterval?.();foregroundInterval=null;quoteAbort?.abort();quoteAbort=null;}
 function suspendRuntime(){if(destroyed)return;interactionLocks.clear();if(interactionResumeTimer!==null){clearTimeout(interactionResumeTimer);interactionResumeTimer=null;}document.documentElement.classList.add("vegas-page-hidden");stopForegroundTimers();stopSymbolRotation();controller.suspend();}
-function resumeRuntime(){if(destroyed||isRuntimeHidden())return;document.documentElement.classList.remove("vegas-page-hidden");controller.resume();startForegroundTimers();startSymbolRotation();refreshCardQuotes();}
-function teardown(){if(destroyed)return;destroyed=true;if(interactionResumeTimer!==null)clearTimeout(interactionResumeTimer);interactionLocks.clear();pageLifecycle?.destroy();stopForegroundTimers();stopSymbolRotation();controller.destroy();rotationPause.destroy();view.destroy();lifecycle.destroy();}
+function resumeRuntime(){if(destroyed||isRuntimeHidden())return;document.documentElement.classList.remove("vegas-page-hidden");controller.resume();refreshDrawingLayout();startForegroundTimers();startSymbolRotation();refreshCardQuotes();}
+function teardown(){if(destroyed)return;destroyed=true;drawingTools.destroy();if(interactionResumeTimer!==null)clearTimeout(interactionResumeTimer);interactionLocks.clear();pageLifecycle?.destroy();stopForegroundTimers();stopSymbolRotation();controller.destroy();rotationPause.destroy();view.destroy();lifecycle.destroy();}
 pageLifecycle=createPageLifecycle({documentRef:document,windowRef:window,onSuspend:suspendRuntime,onResume:resumeRuntime,onPageHideFinal:teardown});
 document.documentElement.classList.toggle("vegas-page-hidden",isRuntimeHidden());
 lifecycle.listen(window,"beforeunload",teardown,{once:true});
@@ -164,6 +186,6 @@ function initializeCards(){
  return ready;
 }
 if(!initializeCards()&&document.readyState!=="complete")lifecycle.listen(window,"load",initializeCards,{once:true});
-selectSymbol(sessionQueue[logoIndex].symbol);sendTimeframeState();startSymbolRotation();refreshCardQuotes();startForegroundTimers();
+selectSymbol(sessionQueue[logoIndex].symbol,true);sendTimeframeState();startSymbolRotation();refreshCardQuotes();startForegroundTimers();
 window.V9Kline=Object.freeze({select:selectSymbol,setTimeframe:switchTimeframe,refresh:()=>controller.refresh(),get state(){return controller.state;}});
 console.info("[VEGAS V9] mounted",INSTRUMENTS.length,"Gate K-line + 5 timeframes + local cards");
